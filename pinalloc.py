@@ -1,127 +1,105 @@
-from collections import namedtuple
-from dataclasses import dataclass, field
-from enum import Enum, auto
+from enum import Enum
+# from z3 import Int, Ints, IntSort, Distinct, And, Or, If, Sum, Array, ArraySort, Not, Solver
+from z3 import *
 
-from z3 import Int, Ints, IntSort, Distinct, And, Or, If, Sum, Array, ArraySort, Not, Solver
-
-class BankType(Enum):
-    GPIO = auto()
-    UART = auto()
-    SWD = auto()
-
-class UartChannels(Enum):
-    TX = auto()
-    RX = auto()
-    CTS = auto()
-    RTS = auto()
-
-class SwdChannels(Enum):
-    SWDIO = auto()
-    SWCLK = auto()
-
-class GpioBanks(Enum):
-    A = auto()
-    B = auto()
-    C = auto()
-    D = auto()
-
-@dataclass
-class AlternateFunction:
-    type: int
-    bank: int
-    channel: int
-
-@dataclass
-class Feature:
-    name: str
-    type: int
-    channels: [int]
-    channel_alloc: [(Int, Int)] = field(default_factory=lambda: list())
-
-blank = AlternateFunction(-1, -1, -1)
-
-af_table_data = [
-    [AlternateFunction(BankType.GPIO.value, GpioBanks.A.value, 1), AlternateFunction(BankType.UART.value, 1, UartChannels.TX.value), AlternateFunction(BankType.SWD.value, 1, SwdChannels.SWDIO.value)],
-    [AlternateFunction(BankType.GPIO.value, GpioBanks.A.value, 2), AlternateFunction(BankType.UART.value, 1, UartChannels.RX.value), AlternateFunction(BankType.SWD.value, 1, SwdChannels.SWCLK.value)],
-    [AlternateFunction(BankType.GPIO.value, GpioBanks.B.value, 1), AlternateFunction(BankType.UART.value, 2, UartChannels.TX.value), blank],
-    [AlternateFunction(BankType.GPIO.value, GpioBanks.B.value, 2), AlternateFunction(BankType.UART.value, 2, UartChannels.RX.value), blank],
-    [AlternateFunction(BankType.GPIO.value, GpioBanks.C.value, 1), blank, blank],
-    [AlternateFunction(BankType.GPIO.value, GpioBanks.C.value, 2), blank, blank],
-    [AlternateFunction(BankType.GPIO.value, GpioBanks.D.value, 1), blank, blank],
-    [AlternateFunction(BankType.GPIO.value, GpioBanks.D.value, 2), blank, blank],
-]
-
-features = [
-    Feature("debug", BankType.SWD.value, (SwdChannels.SWDIO.value, SwdChannels.SWCLK.value)),
-    Feature("console", BankType.UART.value, (UartChannels.TX.value, UartChannels.RX.value)),
-    Feature("single_bank_gpio", BankType.GPIO.value, 2),
-    Feature("random_gpio1", BankType.GPIO.value, 1),
-    Feature("random_gpio2", BankType.GPIO.value, 1),
-]
-
-pin_indexes = list(range(0, 8))
-afid_range = (0, 2)
+import data
+import reader
 
 Z = IntSort()
 
+Signal = Datatype("Signal")
+Signal.declare("func", ("type", Z), ("bank", Z), ("signal", Z))
+Signal = Signal.create()
+
+Pin = Datatype("Pin")
+Pin.declare("active", ("id", Z), ("position", Z), ("signal", Signal))
+Pin.declare("inactive")
+Pin = Pin.create()
+
+pins_data = reader.parse_pin_data("/home/kalyan/Documents/src/STM32_open_pin_data/mcu/STM32F302K(6-8)Ux.xml")
+features = reader.parse_config("config")
+
 solver = Solver()
 
-af_types = Array('af_types', Z, ArraySort(Z, Z))
-af_banks = Array('af_banks', Z, ArraySort(Z, Z))
-af_channels = Array('af_channels', Z, ArraySort(Z, Z))
-for pin_id, functions in enumerate(af_table_data):
-    for af_id, function in enumerate(functions):
-        solver.add(af_types[pin_id][af_id] == function.type)
-        solver.add(af_banks[pin_id][af_id] == function.bank)
-        solver.add(af_channels[pin_id][af_id] == function.channel)
-
 pins = []
+for pin_data in pins_data:
+    signals = []
+    for signal_data in pin_data.signals:
+        if signal_data.type == -1:
+            continue
+
+        signal = Signal.func(
+            signal_data.type.value,
+            signal_data.bank,
+            signal_data.signal if type(signal_data.signal) is int else signal_data.signal.value
+        )
+        signals.append(signal)
+    
+    pin = Const(f"pin_{pin_data.name}", Pin)
+    pins.append(pin)
+
+    choices = Or([Pin.signal(pin) == signal for signal in signals])
+    active = And(Pin.id(pin) == pin_data.id, Pin.position(pin) == pin_data.position, choices)
+    solver.add(Or(Pin == Pin.inactive, active))
+
+active_pins = []
+pin_banks = dict()
 for feature in features:
-    # each channel in each feature is assigned a pin and an AFID
-    explicit_channels = type(feature.channels) is tuple
-    channels = feature.channels if explicit_channels else range(feature.channels)
-    banks = []
+    feature.pins = []
+    for signal_req in feature.signals:
+        signal_name = str(signal_req) if type(signal_req) is int else signal_req.name
+        signal_value = signal_req if type(signal_req) is int else signal_req.value
+        pin = Const(f"pin_assign_{feature.name}_{signal_name}", Pin)
+        feature.pins.append(pin)
+        active_pins.append(pin)
 
-    for channel in channels:
-        pin = Int(f"pin_{feature.name}_{channel}")
-        afid = Int(f"afid_{feature.name}_{channel}")
+        solver.add(Not(pin == Pin.inactive))
+        solver.add(Or([pin == p for p in pins]))
+        if type(signal_req) is not int:
+            solver.add(Signal.signal(Pin.signal(pin)) == signal_value)
 
-        feature.channel_alloc.append((pin, afid))
-        # pin and afid must be valid for the package
-        solver.add(Or([pin == index for index in pin_indexes]))
-        solver.add(And(afid >= afid_range[0], afid <= afid_range[1]))
+    # print(feature.name, feature.type.value)
+    solver.add([Signal.type(Pin.signal(pin)) == feature.type.value for pin in feature.pins])
 
-        solver.add(Not(af_types[pin][afid] == -1))
-        solver.add(Not(af_banks[pin][afid] == -1))
-        solver.add(Not(af_channels[pin][afid] == -1))
+    bank = Signal.bank(Pin.signal(feature.pins[0]))
+    solver.add([Signal.bank(Pin.signal(pin)) == bank for pin in feature.pins[1:]])
+    
+    if feature.type not in data.EXCLUSIVE_BANK_TYPES:
+        if feature.type not in pin_banks:
+            pin_banks[feature.type] = []
+        pin_banks[feature.type].append(bank)
 
-        solver.add(af_types[pin][afid] == feature.type)
-        if explicit_channels:
-            solver.add(af_channels[pin][afid] == channel)
+for _, banks in pin_banks.items():
+    solver.add(Distinct(banks))
 
-        banks.append(af_banks[pin][afid])
-        pins.append(pin)
+solver.add(Distinct(active_pins))
+# print(active_pins)
 
-    solver.add(And([bank == banks[0] for bank in banks[1:]]))
+# for pin in pins:
+#     solver.add(If(Not(Or([pin == p for p in active_pins])), pin == Pin.inactive, True))
+    # if pin not in active_pins:
+    #     solver.add([pin == Pin.inactive])
 
-solver.add(Distinct(pins))
+# solver.add(Sum([If(pin == Pin.inactive, 0, 1) for pin in pins]) == len(active_pins))
 
-if solver.check():
-    model = solver.model()
+solver.check()
+model = solver.model()
 
-    for feature in features:
-        print(f"{feature.name} ({BankType(feature.type).name}): ", end="")
-        mappings = []
-        explicit_channels = type(feature.channels) is tuple
-        channels = feature.channels if explicit_channels else range(feature.channels)
-        for channel, (pin, afid) in zip(channels, feature.channel_alloc):
-            channel_name = str(channel)
-            if BankType(feature.type) == BankType.UART:
-                channel_name = UartChannels(channel).name
-            elif BankType(feature.type) == BankType.SWD:
-                channel_name = SwdChannels(channel).name
+positions = model[Pin.position].as_list()
+position_mapping = dict([(pin.position, pin.name) for pin in pins_data])
 
-            mappings.append(f"{channel_name}={model[pin]}({model[afid]})")
+for feature in features:
+    print(f"{feature.name}:")
+    for signal, pin in zip(feature.signals, feature.pins):
+        signal = str(signal) if type(signal) is int else signal.name
+        for entry in positions:
+            try:
+                if entry[0] == model[pin]:
+                    pos = entry[1]
+                    break
+            except:
+                pass
+        else:
+            pos = model[Pin.position].else_value()
 
-        print(", ".join(mappings))
-    # print(solver.model())
+        print(f"{signal} = {position_mapping[pos.as_long()]}")

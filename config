@@ -1,0 +1,7 @@
+debug uses sys(swdio, swclk)
+console uses usart(tx, rx)
+telemetry uses usart(tx, rx, cts, rts)
+single_bank_gpio uses gpio(3)
+random_gpio1 uses gpio(1)
+random_gpio2 uses gpio(1)
+random_gpio3 uses gpio(1)
